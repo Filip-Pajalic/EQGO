@@ -8,25 +8,25 @@ import (
 	"time"
 )
 
-func TestQueuePublishesTypedEventAndRunsHook(t *testing.T) {
+func TestQueuePublishesTypedEventAndNotifiesObserver(t *testing.T) {
 	t.Parallel()
 
 	q := NewQueue(1)
-	hookDone := make(chan struct{})
+	observed := make(chan struct{})
 	var handled atomic.Int64
 
-	q.AddGlobalHook(func(_ context.Context, info BaseEventInfo, payload any, err error) {
-		defer close(hookDone)
-		if err != nil {
-			t.Errorf("unexpected handler error: %v", err)
+	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
+		defer close(observed)
+		if result.Err != nil {
+			t.Errorf("unexpected handler error: %v", result.Err)
 		}
-		if info.ID != "number-1" || info.Name != "NumberAccepted" {
-			t.Errorf("unexpected event info: %+v", info)
+		if result.Info.ID != "number-1" || result.Info.Name != "NumberAccepted" {
+			t.Errorf("unexpected event info: %+v", result.Info)
 		}
-		if got, ok := payload.(int); !ok || got != 42 {
-			t.Errorf("unexpected payload: %#v", payload)
+		if got, ok := result.Payload.(int); !ok || got != 42 {
+			t.Errorf("unexpected payload: %#v", result.Payload)
 		}
-	})
+	}))
 
 	if err := q.Start(); err != nil {
 		t.Fatalf("start queue: %v", err)
@@ -47,9 +47,9 @@ func TestQueuePublishesTypedEventAndRunsHook(t *testing.T) {
 	}
 
 	select {
-	case <-hookDone:
+	case <-observed:
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for hook")
+		t.Fatal("timed out waiting for observer")
 	}
 
 	if got := handled.Load(); got != 42 {
@@ -114,9 +114,9 @@ func TestHandlerErrorIsReportedAndQueueContinues(t *testing.T) {
 	wantErr := errors.New("handler failed")
 	results := make(chan error, 2)
 
-	q.AddGlobalHook(func(_ context.Context, _ BaseEventInfo, _ any, err error) {
-		results <- err
-	})
+	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
+		results <- result.Err
+	}))
 
 	if err := q.Start(); err != nil {
 		t.Fatalf("start queue: %v", err)
@@ -142,10 +142,10 @@ func TestHandlerErrorIsReportedAndQueueContinues(t *testing.T) {
 	}
 
 	if err := receiveError(t, results); !errors.Is(err, wantErr) {
-		t.Fatalf("first hook error = %v, want %v", err, wantErr)
+		t.Fatalf("first observer error = %v, want %v", err, wantErr)
 	}
 	if err := receiveError(t, results); err != nil {
-		t.Fatalf("second hook error = %v, want nil", err)
+		t.Fatalf("second observer error = %v, want nil", err)
 	}
 }
 
@@ -156,9 +156,9 @@ func TestHandlerPanicIsRecoveredAndQueueContinues(t *testing.T) {
 	results := make(chan error, 2)
 	var handled atomic.Bool
 
-	q.AddGlobalHook(func(_ context.Context, _ BaseEventInfo, _ any, err error) {
-		results <- err
-	})
+	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
+		results <- result.Err
+	}))
 
 	if err := q.Start(); err != nil {
 		t.Fatalf("start queue: %v", err)
@@ -185,10 +185,10 @@ func TestHandlerPanicIsRecoveredAndQueueContinues(t *testing.T) {
 	}
 
 	if err := receiveError(t, results); err == nil {
-		t.Fatal("first hook error = nil, want panic error")
+		t.Fatal("first observer error = nil, want panic error")
 	}
 	if err := receiveError(t, results); err != nil {
-		t.Fatalf("second hook error = %v, want nil", err)
+		t.Fatalf("second observer error = %v, want nil", err)
 	}
 	if !handled.Load() {
 		t.Fatal("queue did not continue after panic")
@@ -284,7 +284,7 @@ func receiveError(t *testing.T, ch <-chan error) error {
 	case err := <-ch:
 		return err
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for hook")
+		t.Fatal("timed out waiting for observer")
 		return nil
 	}
 }

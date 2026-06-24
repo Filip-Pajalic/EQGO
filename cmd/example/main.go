@@ -64,7 +64,7 @@ func updateInventory(ctx context.Context, p ProductAdded) error {
 func main() {
 	ctx := context.Background()
 	eq := event.NewQueue(100)
-	eq.AddGlobalHook(event.AuditLogger)
+	eq.AddObserver(auditLogger{})
 	if err := eq.Start(); err != nil {
 		logger.Error("start queue", slog.Any("error", err))
 		os.Exit(1)
@@ -120,6 +120,25 @@ func main() {
 		logger.Error("stop queue", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+type auditLogger struct{}
+
+func (auditLogger) ObserveEvent(ctx context.Context, result event.DispatchResult) {
+	attrs := []slog.Attr{
+		slog.String("version", "1.0"),
+		slog.String("source", "/example"),
+		slog.String("id", result.Info.ID),
+		slog.String("type", result.Info.Name),
+		slog.Time("time", result.Info.Timestamp),
+		slog.String("datacontenttype", "application/json"),
+		slog.Any("data", result.Payload),
+	}
+	if result.Err != nil {
+		attrs = append(attrs, slog.String("error", result.Err.Error()))
+	}
+
+	logger.LogAttrs(ctx, slog.LevelInfo, "event", attrs...)
 }
 
 func publish(ctx context.Context, q *event.Queue, e event.ExecutableEvent) {

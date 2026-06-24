@@ -3,7 +3,6 @@ package event
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"time"
 )
 
@@ -78,27 +77,5 @@ func (e *TypedEvent[T]) Dispatch(ctx context.Context) (err error) {
 // EventInfo returns the event metadata.
 func (e *TypedEvent[T]) EventInfo() BaseEventInfo { return e.Info }
 
-// PayloadData returns the typed payload as any for queue hooks.
+// PayloadData returns the typed payload as any for queue observers.
 func (e *TypedEvent[T]) PayloadData() any { return e.Payload }
-
-// AuditLogger logs event metadata, payload data, and handler errors with slog.
-func AuditLogger(ctx context.Context, info BaseEventInfo, payload any, err error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	attrs := []slog.Attr{
-		slog.String("version", "1.0"),
-		slog.String("source", "/eqgo"),
-		slog.String("id", info.ID),
-		slog.String("type", info.Name),
-		slog.Time("time", info.Timestamp),
-		slog.String("datacontenttype", "application/json"),
-		slog.Any("data", payload),
-	}
-	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
-	}
-
-	slog.LogAttrs(ctx, slog.LevelInfo, "event", attrs...)
-}

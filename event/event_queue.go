@@ -25,8 +25,27 @@ type ExecutableEvent interface {
 	PayloadData() any
 }
 
-// Hook observes every dispatched event and its handler result.
-type Hook func(context.Context, BaseEventInfo, any, error)
+// DispatchResult is the outcome observed after an event is dispatched.
+type DispatchResult struct {
+	Info    BaseEventInfo
+	Payload any
+	Err     error
+}
+
+// Observer receives the result of each dispatched event.
+type Observer interface {
+	ObserveEvent(context.Context, DispatchResult)
+}
+
+// ObserverFunc adapts a function into an Observer.
+type ObserverFunc func(context.Context, DispatchResult)
+
+// ObserveEvent calls f with the dispatch result.
+func (f ObserverFunc) ObserveEvent(ctx context.Context, result DispatchResult) {
+	if f != nil {
+		f(ctx, result)
+	}
+}
 
 // Queue dispatches mixed event types through one serial in-process worker.
 type Queue struct {
@@ -40,8 +59,8 @@ type Queue struct {
 	closed  bool
 	active  int
 
-	hooksMu sync.RWMutex
-	hooks   []Hook
+	observersMu sync.RWMutex
+	observers   []Observer
 
 	wg sync.WaitGroup
 }
@@ -136,15 +155,15 @@ func (q *Queue) Stop(ctx context.Context) error {
 	}
 }
 
-// AddGlobalHook registers a hook that runs after each event dispatch.
-func (q *Queue) AddGlobalHook(h Hook) {
-	if h == nil {
+// AddObserver registers an observer that runs after each event dispatch.
+func (q *Queue) AddObserver(observer Observer) {
+	if observer == nil {
 		return
 	}
 
-	q.hooksMu.Lock()
-	defer q.hooksMu.Unlock()
-	q.hooks = append(q.hooks, h)
+	q.observersMu.Lock()
+	defer q.observersMu.Unlock()
+	q.observers = append(q.observers, observer)
 }
 
 func (q *Queue) run() {
@@ -188,17 +207,22 @@ func (q *Queue) drain() {
 
 func (q *Queue) dispatch(ctx context.Context, e ExecutableEvent) {
 	err := e.Dispatch(ctx)
+	result := DispatchResult{
+		Info:    e.EventInfo(),
+		Payload: e.PayloadData(),
+		Err:     err,
+	}
 
-	q.hooksMu.RLock()
-	hooks := slices.Clone(q.hooks)
-	q.hooksMu.RUnlock()
+	q.observersMu.RLock()
+	observers := slices.Clone(q.observers)
+	q.observersMu.RUnlock()
 
-	for _, h := range hooks {
+	for _, observer := range observers {
 		func() {
 			defer func() {
 				_ = recover()
 			}()
-			h(ctx, e.EventInfo(), e.PayloadData(), err)
+			observer.ObserveEvent(ctx, result)
 		}()
 	}
 }
