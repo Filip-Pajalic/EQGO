@@ -1,6 +1,6 @@
 # EQGO
 
-EQGO is a small in-process event queue for Go. It keeps payload handlers type-safe with generics while exposing one simple queue for mixed event types.
+EQGO is an in-process event dispatcher with queued publishing for Go. It keeps payload handlers type-safe with generics while exposing one simple dispatcher for mixed event types.
 
 It is meant for lightweight application events, demos, and local workflows. It is not a distributed broker, persistent queue, or retry system.
 
