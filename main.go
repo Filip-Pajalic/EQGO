@@ -1,23 +1,23 @@
 package main
 
 import (
-	"app/event"
+	"context"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/Filip-Pajalic/EQGO/event"
 )
 
 var logger = initLogger()
 
 func initLogger() *slog.Logger {
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		AddSource:   false,
-		ReplaceAttr: nil,
-	})
-	return slog.New(handler)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+	return logger
 }
 
 type UserCreated struct {
@@ -36,99 +36,97 @@ type ProductAdded struct {
 	Stock     int
 }
 
-func logUser(u UserCreated) {
-	logger.Info("UserCreated",
+func logUser(ctx context.Context, u UserCreated) error {
+	logger.InfoContext(ctx, "UserCreated",
 		slog.String("username", u.Username),
 		slog.String("email", u.Email),
 	)
+	return nil
 }
 
-func sendInvoice(o OrderPlaced) {
-	logger.Info("OrderPlaced",
+func sendInvoice(ctx context.Context, o OrderPlaced) error {
+	logger.InfoContext(ctx, "OrderPlaced",
 		slog.String("order_id", o.OrderID),
 		slog.Float64("amount", o.Amount),
 	)
+	return nil
 }
 
-func updateInventory(p ProductAdded) {
-	logger.Info("ProductAdded",
+func updateInventory(ctx context.Context, p ProductAdded) error {
+	logger.InfoContext(ctx, "ProductAdded",
 		slog.String("product_id", p.ProductID),
 		slog.String("name", p.Name),
 		slog.Int("stock", p.Stock),
 	)
+	return nil
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
-	numEvents := 10
-	eq := event.NewEventQueue(100)
+	ctx := context.Background()
+	eq := event.NewQueue(100)
 	eq.AddGlobalHook(event.AuditLogger)
-	eq.Start()
+	if err := eq.Start(); err != nil {
+		logger.Error("start queue", slog.Any("error", err))
+		os.Exit(1)
+	}
 
 	var wg sync.WaitGroup
+	for i := range 10 {
+		i := i
 
-	for i := 0; i < numEvents; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
-
-			userEvt := &event.TypedEvent[UserCreated]{
-				Info: event.BaseEventInfo{
-					ID:        fmt.Sprintf("userEvt-%d", i),
-					Name:      "UserCreated",
-					Timestamp: time.Now(),
-				},
-				Payload: UserCreated{
+		wg.Go(func() {
+			time.Sleep(time.Duration(rand.IntN(500)) * time.Millisecond)
+			userEvt := event.New(
+				event.NewInfo(fmt.Sprintf("user-%d", i), "UserCreated"),
+				UserCreated{
 					Username: fmt.Sprintf("alice%d", i),
 					Email:    fmt.Sprintf("alice%d@example.com", i),
 				},
-			}
-			userEvt.On(logUser)
-			eq.Add(userEvt)
-		}(i)
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
+				logUser,
+			)
+			publish(ctx, eq, userEvt)
+		})
 
-			orderEvt := &event.TypedEvent[OrderPlaced]{
-				Info: event.BaseEventInfo{
-					ID:        fmt.Sprintf("orderEvt-%d", i),
-					Name:      "OrderPlaced",
-					Timestamp: time.Now(),
-				},
-				Payload: OrderPlaced{
+		wg.Go(func() {
+			time.Sleep(time.Duration(rand.IntN(500)) * time.Millisecond)
+			orderEvt := event.New(
+				event.NewInfo(fmt.Sprintf("order-%d", i), "OrderPlaced"),
+				OrderPlaced{
 					OrderID: fmt.Sprintf("ORD%03d", i),
 					Amount:  100.0 + float64(i),
 				},
-			}
-			orderEvt.On(sendInvoice)
-			eq.Add(orderEvt)
-		}(i)
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
+				sendInvoice,
+			)
+			publish(ctx, eq, orderEvt)
+		})
 
-			productEvt := &event.TypedEvent[ProductAdded]{
-				Info: event.BaseEventInfo{
-					ID:        fmt.Sprintf("productEvt-%d", i),
-					Name:      "ProductAdded",
-					Timestamp: time.Now(),
-				},
-				Payload: ProductAdded{
+		wg.Go(func() {
+			time.Sleep(time.Duration(rand.IntN(500)) * time.Millisecond)
+			productEvt := event.New(
+				event.NewInfo(fmt.Sprintf("product-%d", i), "ProductAdded"),
+				ProductAdded{
 					ProductID: fmt.Sprintf("P%03d", i),
 					Name:      fmt.Sprintf("Gadget%d", i),
 					Stock:     42 + i,
 				},
-			}
-			productEvt.On(updateInventory)
-			eq.Add(productEvt)
-		}(i)
+				updateInventory,
+			)
+			publish(ctx, eq, productEvt)
+		})
 	}
 
 	wg.Wait()
-	eq.Stop()
+	if err := eq.Stop(ctx); err != nil {
+		logger.Error("stop queue", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
+func publish(ctx context.Context, q *event.Queue, e event.ExecutableEvent) {
+	if err := q.Publish(ctx, e); err != nil {
+		logger.ErrorContext(ctx, "publish event",
+			slog.String("event", e.EventInfo().Name),
+			slog.Any("error", err),
+		)
+	}
 }

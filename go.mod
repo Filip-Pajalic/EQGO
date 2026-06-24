@@ -1,3 +1,3 @@
-module app
+module github.com/Filip-Pajalic/EQGO
 
-go 1.24.0
+go 1.26.4
