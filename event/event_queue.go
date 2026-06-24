@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 )
@@ -11,19 +12,15 @@ var (
 	// ErrNilEvent is returned when Publish receives a nil event.
 	ErrNilEvent = errors.New("event queue: nil event")
 
-	// ErrNotStarted is returned when Publish is called before Start.
-	ErrNotStarted = errors.New("event queue: not started")
-
 	// ErrClosed is returned when the queue has already been stopped.
 	ErrClosed = errors.New("event queue: closed")
-)
 
-// ExecutableEvent is the common interface used by Queue for all payload types.
-type ExecutableEvent interface {
-	Dispatch(context.Context) error
-	EventInfo() BaseEventInfo
-	PayloadData() any
-}
+	// ErrAsyncStarted is returned when manual dispatch is used after Start.
+	ErrAsyncStarted = errors.New("event queue: async worker started")
+
+	// ErrNilHandler is returned when Subscribe receives a nil handler.
+	ErrNilHandler = errors.New("event queue: nil handler")
+)
 
 // DispatchResult is the outcome observed after an event is dispatched.
 type DispatchResult struct {
@@ -47,9 +44,9 @@ func (f ObserverFunc) ObserveEvent(ctx context.Context, result DispatchResult) {
 	}
 }
 
-// Queue dispatches mixed event types through one serial in-process worker.
+// Queue dispatches mixed event types through either manual drains or one async worker.
 type Queue struct {
-	events  chan ExecutableEvent
+	events  chan Event
 	done    chan struct{}
 	stopped chan struct{}
 
@@ -58,6 +55,11 @@ type Queue struct {
 	started bool
 	closed  bool
 	active  int
+
+	subscribersMu sync.RWMutex
+	subscribers   map[string][]subscriber
+
+	dispatchMu sync.Mutex
 
 	observersMu sync.RWMutex
 	observers   []Observer
@@ -68,15 +70,28 @@ type Queue struct {
 // NewQueue creates a queue with the given event buffer size.
 func NewQueue(buffer int) *Queue {
 	q := &Queue{
-		events:  make(chan ExecutableEvent, max(buffer, 0)),
-		done:    make(chan struct{}),
-		stopped: make(chan struct{}),
+		events:      make(chan Event, max(buffer, 0)),
+		done:        make(chan struct{}),
+		stopped:     make(chan struct{}),
+		subscribers: make(map[string][]subscriber),
 	}
 	q.state = sync.NewCond(&q.stateMu)
 	return q
 }
 
-// Start starts the queue worker. Calling Start more than once is a no-op.
+// Subscribe registers a typed handler for events with eventName.
+func Subscribe[T any](q *Queue, eventName string, h Handler[T]) error {
+	if h == nil {
+		return ErrNilHandler
+	}
+
+	q.subscribersMu.Lock()
+	defer q.subscribersMu.Unlock()
+	q.subscribers[eventName] = append(q.subscribers[eventName], typedSubscriber[T]{handler: h})
+	return nil
+}
+
+// Start starts the async queue worker. Calling Start more than once is a no-op.
 func (q *Queue) Start() error {
 	q.stateMu.Lock()
 	defer q.stateMu.Unlock()
@@ -97,7 +112,8 @@ func (q *Queue) Start() error {
 }
 
 // Publish queues an event or returns when the context is canceled or the queue closes.
-func (q *Queue) Publish(ctx context.Context, e ExecutableEvent) error {
+// Queued events are dispatched by Start's worker or by DispatchPending.
+func (q *Queue) Publish(ctx context.Context, e Event) error {
 	if e == nil {
 		return ErrNilEvent
 	}
@@ -106,10 +122,6 @@ func (q *Queue) Publish(ctx context.Context, e ExecutableEvent) error {
 	}
 
 	q.stateMu.Lock()
-	if !q.started {
-		q.stateMu.Unlock()
-		return ErrNotStarted
-	}
 	if q.closed {
 		q.stateMu.Unlock()
 		return ErrClosed
@@ -128,7 +140,42 @@ func (q *Queue) Publish(ctx context.Context, e ExecutableEvent) error {
 	}
 }
 
-// Stop closes the queue, unblocks pending publishes, drains queued events, and waits for the worker.
+// DispatchPending synchronously dispatches queued events without starting a worker.
+// Use this from a game loop or another owner-controlled dispatch point.
+func (q *Queue) DispatchPending(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	q.stateMu.Lock()
+	if q.closed {
+		q.stateMu.Unlock()
+		return 0, ErrClosed
+	}
+	if q.started {
+		q.stateMu.Unlock()
+		return 0, ErrAsyncStarted
+	}
+	q.stateMu.Unlock()
+
+	dispatched := 0
+	q.dispatchMu.Lock()
+	defer q.dispatchMu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return dispatched, ctx.Err()
+		case e := <-q.events:
+			q.dispatch(ctx, e)
+			dispatched++
+		default:
+			return dispatched, nil
+		}
+	}
+}
+
+// Stop closes the queue, unblocks pending publishes, drains queued events, and waits for dispatch to finish.
 func (q *Queue) Stop(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -144,7 +191,9 @@ func (q *Queue) Stop(ctx context.Context) error {
 	q.stateMu.Unlock()
 
 	if !wasStarted {
-		return nil
+		q.waitForPublishers()
+		q.drainWithContext(ctx)
+		return ctx.Err()
 	}
 
 	select {
@@ -170,7 +219,9 @@ func (q *Queue) run() {
 	for {
 		select {
 		case e := <-q.events:
+			q.dispatchMu.Lock()
 			q.dispatch(context.Background(), e)
+			q.dispatchMu.Unlock()
 		case <-q.done:
 			q.waitForPublishers()
 			q.drain()
@@ -195,6 +246,9 @@ func (q *Queue) waitForPublishers() {
 }
 
 func (q *Queue) drain() {
+	q.dispatchMu.Lock()
+	defer q.dispatchMu.Unlock()
+
 	for {
 		select {
 		case e := <-q.events:
@@ -205,8 +259,24 @@ func (q *Queue) drain() {
 	}
 }
 
-func (q *Queue) dispatch(ctx context.Context, e ExecutableEvent) {
-	err := e.Dispatch(ctx)
+func (q *Queue) drainWithContext(ctx context.Context) {
+	q.dispatchMu.Lock()
+	defer q.dispatchMu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e := <-q.events:
+			q.dispatch(ctx, e)
+		default:
+			return
+		}
+	}
+}
+
+func (q *Queue) dispatch(ctx context.Context, e Event) {
+	err := q.dispatchToSubscribers(ctx, e)
 	result := DispatchResult{
 		Info:    e.EventInfo(),
 		Payload: e.PayloadData(),
@@ -225,4 +295,43 @@ func (q *Queue) dispatch(ctx context.Context, e ExecutableEvent) {
 			observer.ObserveEvent(ctx, result)
 		}()
 	}
+}
+
+func (q *Queue) dispatchToSubscribers(ctx context.Context, e Event) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("event %q handler panicked: %v", e.EventInfo().Name, recovered)
+		}
+	}()
+
+	q.subscribersMu.RLock()
+	subscribers := slices.Clone(q.subscribers[e.EventInfo().Name])
+	q.subscribersMu.RUnlock()
+
+	for _, subscriber := range subscribers {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := subscriber.dispatch(ctx, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type subscriber interface {
+	dispatch(context.Context, Event) error
+}
+
+type typedSubscriber[T any] struct {
+	handler Handler[T]
+}
+
+func (s typedSubscriber[T]) dispatch(ctx context.Context, e Event) error {
+	payload, ok := e.PayloadData().(T)
+	if !ok {
+		var expected T
+		return fmt.Errorf("event %q payload has type %T, handler expects %T", e.EventInfo().Name, e.PayloadData(), expected)
+	}
+	return s.handler(ctx, e.EventInfo(), payload)
 }

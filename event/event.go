@@ -2,7 +2,6 @@ package event
 
 import (
 	"context"
-	"fmt"
 	"time"
 )
 
@@ -22,56 +21,27 @@ func NewInfo(id, name string) BaseEventInfo {
 	}
 }
 
-// Handler handles a typed event payload.
-type Handler[T any] func(context.Context, T) error
-
-// TypedEvent stores a payload and the typed handlers that should receive it.
-type TypedEvent[T any] struct {
-	Info     BaseEventInfo
-	Payload  T
-	handlers []Handler[T]
+// Event is the common interface used by Queue for all payload types.
+type Event interface {
+	EventInfo() BaseEventInfo
+	PayloadData() any
 }
 
-// New creates a typed event with optional handlers.
-func New[T any](info BaseEventInfo, payload T, handlers ...Handler[T]) *TypedEvent[T] {
-	e := &TypedEvent[T]{
+// Handler handles a typed event payload.
+type Handler[T any] func(context.Context, BaseEventInfo, T) error
+
+// TypedEvent stores event metadata and a typed payload.
+type TypedEvent[T any] struct {
+	Info    BaseEventInfo
+	Payload T
+}
+
+// New creates a typed event.
+func New[T any](info BaseEventInfo, payload T) *TypedEvent[T] {
+	return &TypedEvent[T]{
 		Info:    info,
 		Payload: payload,
 	}
-	return e.On(handlers...)
-}
-
-// On registers handlers and returns the event for chaining.
-func (e *TypedEvent[T]) On(handlers ...Handler[T]) *TypedEvent[T] {
-	for _, h := range handlers {
-		if h != nil {
-			e.handlers = append(e.handlers, h)
-		}
-	}
-	return e
-}
-
-// Dispatch runs handlers in order until one fails or the context is canceled.
-func (e *TypedEvent[T]) Dispatch(ctx context.Context) (err error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("event %q handler panicked: %v", e.Info.Name, recovered)
-		}
-	}()
-
-	for _, h := range e.handlers {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := h(ctx, e.Payload); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // EventInfo returns the event metadata.

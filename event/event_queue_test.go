@@ -8,12 +8,22 @@ import (
 	"time"
 )
 
-func TestQueuePublishesTypedEventAndNotifiesObserver(t *testing.T) {
+func TestQueuePublishesTypedEventToSubscriberAndObserver(t *testing.T) {
 	t.Parallel()
 
 	q := NewQueue(1)
 	observed := make(chan struct{})
 	var handled atomic.Int64
+
+	if err := Subscribe(q, "NumberAccepted", func(_ context.Context, info BaseEventInfo, n int) error {
+		if info.ID != "number-1" {
+			t.Errorf("handler saw event ID %q, want number-1", info.ID)
+		}
+		handled.Store(int64(n))
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
 		defer close(observed)
@@ -37,11 +47,7 @@ func TestQueuePublishesTypedEventAndNotifiesObserver(t *testing.T) {
 		}
 	})
 
-	evt := New(NewInfo("number-1", "NumberAccepted"), 42, func(_ context.Context, n int) error {
-		handled.Store(int64(n))
-		return nil
-	})
-
+	evt := New(NewInfo("number-1", "NumberAccepted"), 42)
 	if err := q.Publish(context.Background(), evt); err != nil {
 		t.Fatalf("publish event: %v", err)
 	}
@@ -61,13 +67,12 @@ func TestQueueLifecycleErrors(t *testing.T) {
 	t.Parallel()
 
 	q := NewQueue(1)
-	evt := New(NewInfo("id", "Name"), "payload")
 
-	if err := q.Publish(context.Background(), evt); !errors.Is(err, ErrNotStarted) {
-		t.Fatalf("publish before start error = %v, want %v", err, ErrNotStarted)
-	}
 	if err := q.Publish(context.Background(), nil); !errors.Is(err, ErrNilEvent) {
 		t.Fatalf("nil event error = %v, want %v", err, ErrNilEvent)
+	}
+	if err := Subscribe[string](q, "Name", nil); !errors.Is(err, ErrNilHandler) {
+		t.Fatalf("nil handler error = %v, want %v", err, ErrNilHandler)
 	}
 	if err := q.Stop(context.Background()); err != nil {
 		t.Fatalf("stop unopened queue: %v", err)
@@ -77,14 +82,92 @@ func TestQueueLifecycleErrors(t *testing.T) {
 	}
 }
 
+func TestDispatchPendingProcessesEventsWithoutAsyncWorker(t *testing.T) {
+	t.Parallel()
+
+	q := NewQueue(4)
+	var handled atomic.Int64
+
+	if err := Subscribe(q, "Counted", func(context.Context, BaseEventInfo, int) error {
+		handled.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	for i := range 3 {
+		if err := q.Publish(context.Background(), New(NewInfo("id", "Counted"), i)); err != nil {
+			t.Fatalf("publish event %d: %v", i, err)
+		}
+	}
+
+	dispatched, err := q.DispatchPending(context.Background())
+	if err != nil {
+		t.Fatalf("dispatch pending: %v", err)
+	}
+	if dispatched != 3 {
+		t.Fatalf("dispatched %d events, want 3", dispatched)
+	}
+	if got := handled.Load(); got != 3 {
+		t.Fatalf("handled %d events, want 3", got)
+	}
+}
+
+func TestDispatchPendingRejectsAsyncWorkerMode(t *testing.T) {
+	t.Parallel()
+
+	q := NewQueue(1)
+	if err := q.Start(); err != nil {
+		t.Fatalf("start queue: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := q.Stop(context.Background()); err != nil {
+			t.Fatalf("stop queue: %v", err)
+		}
+	})
+
+	if _, err := q.DispatchPending(context.Background()); !errors.Is(err, ErrAsyncStarted) {
+		t.Fatalf("dispatch pending error = %v, want %v", err, ErrAsyncStarted)
+	}
+}
+
+func TestStopDrainsManualQueue(t *testing.T) {
+	t.Parallel()
+
+	q := NewQueue(2)
+	var handled atomic.Int64
+
+	if err := Subscribe(q, "Counted", func(context.Context, BaseEventInfo, int) error {
+		handled.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	for i := range 2 {
+		if err := q.Publish(context.Background(), New(NewInfo("id", "Counted"), i)); err != nil {
+			t.Fatalf("publish event %d: %v", i, err)
+		}
+	}
+	if err := q.Stop(context.Background()); err != nil {
+		t.Fatalf("stop queue: %v", err)
+	}
+	if got := handled.Load(); got != 2 {
+		t.Fatalf("handled %d events, want 2", got)
+	}
+}
+
 func TestStopDrainsQueuedEventsAndClosesQueue(t *testing.T) {
 	t.Parallel()
 
 	q := NewQueue(4)
 	var handled atomic.Int64
-	handler := func(context.Context, int) error {
+
+	if err := Subscribe(q, "Counted", func(context.Context, BaseEventInfo, int) error {
 		handled.Add(1)
 		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
 	}
 
 	if err := q.Start(); err != nil {
@@ -92,7 +175,7 @@ func TestStopDrainsQueuedEventsAndClosesQueue(t *testing.T) {
 	}
 
 	for i := range 4 {
-		if err := q.Publish(context.Background(), New(NewInfo("id", "Counted"), i, handler)); err != nil {
+		if err := q.Publish(context.Background(), New(NewInfo("id", "Counted"), i)); err != nil {
 			t.Fatalf("publish event %d: %v", i, err)
 		}
 	}
@@ -114,6 +197,17 @@ func TestHandlerErrorIsReportedAndQueueContinues(t *testing.T) {
 	wantErr := errors.New("handler failed")
 	results := make(chan error, 2)
 
+	if err := Subscribe(q, "Bad", func(context.Context, BaseEventInfo, int) error {
+		return wantErr
+	}); err != nil {
+		t.Fatalf("subscribe bad handler: %v", err)
+	}
+	if err := Subscribe(q, "Good", func(context.Context, BaseEventInfo, int) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe good handler: %v", err)
+	}
+
 	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
 		results <- result.Err
 	}))
@@ -127,17 +221,10 @@ func TestHandlerErrorIsReportedAndQueueContinues(t *testing.T) {
 		}
 	})
 
-	bad := New(NewInfo("bad", "Bad"), 1, func(context.Context, int) error {
-		return wantErr
-	})
-	good := New(NewInfo("good", "Good"), 2, func(context.Context, int) error {
-		return nil
-	})
-
-	if err := q.Publish(context.Background(), bad); err != nil {
+	if err := q.Publish(context.Background(), New(NewInfo("bad", "Bad"), 1)); err != nil {
 		t.Fatalf("publish bad event: %v", err)
 	}
-	if err := q.Publish(context.Background(), good); err != nil {
+	if err := q.Publish(context.Background(), New(NewInfo("good", "Good"), 2)); err != nil {
 		t.Fatalf("publish good event: %v", err)
 	}
 
@@ -156,6 +243,18 @@ func TestHandlerPanicIsRecoveredAndQueueContinues(t *testing.T) {
 	results := make(chan error, 2)
 	var handled atomic.Bool
 
+	if err := Subscribe(q, "Panic", func(context.Context, BaseEventInfo, int) error {
+		panic("boom")
+	}); err != nil {
+		t.Fatalf("subscribe panic handler: %v", err)
+	}
+	if err := Subscribe(q, "Good", func(context.Context, BaseEventInfo, int) error {
+		handled.Store(true)
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe good handler: %v", err)
+	}
+
 	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
 		results <- result.Err
 	}))
@@ -169,18 +268,10 @@ func TestHandlerPanicIsRecoveredAndQueueContinues(t *testing.T) {
 		}
 	})
 
-	panicEvent := New(NewInfo("panic", "Panic"), 1, func(context.Context, int) error {
-		panic("boom")
-	})
-	good := New(NewInfo("good", "Good"), 2, func(context.Context, int) error {
-		handled.Store(true)
-		return nil
-	})
-
-	if err := q.Publish(context.Background(), panicEvent); err != nil {
+	if err := q.Publish(context.Background(), New(NewInfo("panic", "Panic"), 1)); err != nil {
 		t.Fatalf("publish panic event: %v", err)
 	}
-	if err := q.Publish(context.Background(), good); err != nil {
+	if err := q.Publish(context.Background(), New(NewInfo("good", "Good"), 2)); err != nil {
 		t.Fatalf("publish good event: %v", err)
 	}
 
@@ -195,15 +286,51 @@ func TestHandlerPanicIsRecoveredAndQueueContinues(t *testing.T) {
 	}
 }
 
+func TestPayloadTypeMismatchIsReported(t *testing.T) {
+	t.Parallel()
+
+	q := NewQueue(1)
+	results := make(chan error, 1)
+
+	if err := Subscribe(q, "WrongPayload", func(context.Context, BaseEventInfo, int) error {
+		t.Fatal("handler should not run for wrong payload type")
+		return nil
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	q.AddObserver(ObserverFunc(func(_ context.Context, result DispatchResult) {
+		results <- result.Err
+	}))
+
+	if err := q.Start(); err != nil {
+		t.Fatalf("start queue: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := q.Stop(context.Background()); err != nil {
+			t.Fatalf("stop queue: %v", err)
+		}
+	})
+
+	if err := q.Publish(context.Background(), New(NewInfo("wrong", "WrongPayload"), "not an int")); err != nil {
+		t.Fatalf("publish event: %v", err)
+	}
+	if err := receiveError(t, results); err == nil {
+		t.Fatal("observer error = nil, want payload type error")
+	}
+}
+
 func TestPublishReturnsContextErrorWhenQueueIsFull(t *testing.T) {
 	t.Parallel()
 
 	q := NewQueue(0)
 	release := make(chan struct{})
-	blocker := New(NewInfo("blocker", "Blocker"), 1, func(context.Context, int) error {
+
+	if err := Subscribe(q, "Blocker", func(context.Context, BaseEventInfo, int) error {
 		<-release
 		return nil
-	})
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	if err := q.Start(); err != nil {
 		t.Fatalf("start queue: %v", err)
@@ -215,7 +342,7 @@ func TestPublishReturnsContextErrorWhenQueueIsFull(t *testing.T) {
 		}
 	})
 
-	if err := q.Publish(context.Background(), blocker); err != nil {
+	if err := q.Publish(context.Background(), New(NewInfo("blocker", "Blocker"), 1)); err != nil {
 		t.Fatalf("publish blocker: %v", err)
 	}
 
@@ -233,16 +360,19 @@ func TestStopUnblocksPendingPublishAndDrainsInFlightSends(t *testing.T) {
 
 	q := NewQueue(0)
 	release := make(chan struct{})
-	blocker := New(NewInfo("blocker", "Blocker"), 1, func(context.Context, int) error {
+
+	if err := Subscribe(q, "Blocker", func(context.Context, BaseEventInfo, int) error {
 		<-release
 		return nil
-	})
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
 
 	if err := q.Start(); err != nil {
 		t.Fatalf("start queue: %v", err)
 	}
 
-	if err := q.Publish(context.Background(), blocker); err != nil {
+	if err := q.Publish(context.Background(), New(NewInfo("blocker", "Blocker"), 1)); err != nil {
 		t.Fatalf("publish blocker: %v", err)
 	}
 
